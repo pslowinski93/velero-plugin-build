@@ -1,0 +1,84 @@
+# Build velero-plugin-for-aws v1.14.4 + upstream PR #335 (velero#10543: the S3 uploader inherits the
+# client's RequestChecksumCalculation) for CABP DEV / Dell ECS multipart uploads.
+# Install as: .github/workflows/build-velero-plugin-pr335.yml  (Actions tab -> Run workflow)
+# Output: artifact "velero-plugin-for-aws-v1.14.4-pr335" = image tarball + sha256 + patch + BUILD-INFO.txt
+name: build-velero-plugin-pr335
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TAG: v1.14.4-pr335
+      GOIMG: golang:1.26.8-trixie
+    steps:
+      - name: Clone v1.14.4, apply PR 335, test, build, export
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="localhost/velero/velero-plugin-for-aws:${TAG}"
+          OUT="velero-plugin-for-aws_${TAG}.tar"
+          mkdir -p out
+
+          echo "== 1/7 clone upstream tag v1.14.4"
+          git -c advice.detachedHead=false clone -q --branch v1.14.4 --depth 1 https://github.com/velero-io/velero-plugin-for-aws.git src
+          SRC_COMMIT="$(git -C src rev-parse HEAD)"
+
+          echo "== 2/7 fetch + apply upstream PR #335 (production hunks only; the unit-test hunk conflicts on v1.14.4)"
+          curl -sSfL https://github.com/velero-io/velero-plugin-for-aws/commit/a40233c03c.patch -o out/pr335.patch
+          cd src
+          git apply --index --include='velero-plugin-for-aws/object_store.go' --include='changelogs/*' ../out/pr335.patch
+          git diff --cached --stat
+          [ "$(git diff --cached --name-only | wc -l)" -eq 2 ] || { echo "ERROR: unexpected files changed"; exit 1; }
+          grep -q 'func newS3Uploader' velero-plugin-for-aws/object_store.go || { echo "ERROR: newS3Uploader missing"; exit 1; }
+          grep -q 'o.s3Uploader = newS3Uploader(client)' velero-plugin-for-aws/object_store.go || { echo "ERROR: call site not patched"; exit 1; }
+          if grep -q 'manager.NewUploader(client)' velero-plugin-for-aws/object_store.go; then echo "ERROR: old NewUploader call still present"; exit 1; fi
+
+          echo "== 3/7 pull Go build image"
+          docker pull "$GOIMG"
+
+          echo "== 4/7 unit tests"
+          docker run --rm -v "$PWD":/src -w /src "$GOIMG" go test ./velero-plugin-for-aws/...
+
+          echo "== 5/7 build linux/amd64 image"
+          docker build --platform linux/amd64 -t "$IMG" .
+
+          echo "== 6/7 verify image"
+          ARCH="$(docker image inspect "$IMG" --format '{{.Os}}/{{.Architecture}}')"
+          [ "$ARCH" = "linux/amd64" ] || { echo "ERROR: image is $ARCH, expected linux/amd64"; exit 1; }
+          echo "platform: $ARCH"
+
+          echo "== 7/7 export tarball + checksum + build record"
+          cd ../out
+          docker save -o "$OUT" "$IMG"
+          sha256sum "$OUT" | tee "$OUT.sha256"
+          {
+            echo "image:          $IMG"
+            echo "image id:       $(docker image inspect "$IMG" --format '{{.Id}}')"
+            echo "platform:       $ARCH"
+            echo "base source:    github.com/velero-io/velero-plugin-for-aws tag v1.14.4 ($SRC_COMMIT)"
+            echo "patch:          upstream commit a40233c03c (PR #335), object_store.go + changelog only"
+            echo "patch sha256:   $(sha256sum pr335.patch | awk '{print $1}')"
+            echo "tarball sha256: $(awk '{print $1}' "$OUT.sha256")"
+            echo "go build image: $GOIMG"
+            echo "docker:         $(docker --version)"
+            echo "built:          $(date -u +%Y-%m-%dT%H:%M:%SZ) on GitHub Actions ${ImageOS:-ubuntu}/${ImageVersion:-unknown}"
+            echo "workflow run:   ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "target ref:     localhost/velero/velero-plugin-for-aws:${TAG}"
+          } > BUILD-INFO.txt
+          cat BUILD-INFO.txt
+          ls -l
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: velero-plugin-for-aws-v1.14.4-pr335
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
